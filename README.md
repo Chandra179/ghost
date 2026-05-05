@@ -1,4 +1,4 @@
-# Go SDK
+# Ghost
 
 This is a utility project for Golang. Each module lives in its own subdirectory with an independent `go.mod`.
 
@@ -6,7 +6,7 @@ This is a utility project for Golang. Each module lives in its own subdirectory 
 
 1. **Create a subdirectory** named after your module:
    ```
-   gosdk/
+   ghost/
    └── yourmodule/
        ├── go.mod
        ├── go.sum
@@ -98,3 +98,6 @@ err = client.WithTransaction(ctx, sql.LevelReadCommitted, func(ctx context.Conte
 if db.IsDuplicateKeyError(err) { ... }
 if db.IsTimeoutError(err)      { ... }
 ```
+
+## Prompt
+see proven implementation from big companies, do we need abstraction? is it general implementation? do the implementation handle specific usecase only or general? is it configurable or not? document it in architecture decision record in adr.md in the directory if not exist create one.

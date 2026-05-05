@@ -2,11 +2,12 @@ package cache
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
-	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -104,7 +105,7 @@ func TestRedisCache_Get(t *testing.T) {
 	t.Run("get non-existent key", func(t *testing.T) {
 		val, err := cache.Get(ctx, "non-existent-key")
 		assert.Error(t, err)
-		assert.Equal(t, redis.Nil, err)
+		assert.True(t, IsCacheMiss(err))
 		assert.Empty(t, val)
 	})
 
@@ -115,7 +116,7 @@ func TestRedisCache_Get(t *testing.T) {
 
 		val, err := cache.Get(ctx, "expired-key")
 		assert.Error(t, err)
-		assert.Equal(t, redis.Nil, err)
+		assert.True(t, IsCacheMiss(err))
 		assert.Empty(t, val)
 	})
 }
@@ -349,6 +350,120 @@ func TestRedisCache_IntegrationScenario(t *testing.T) {
 		// Verify deletion
 		_, err = cache.Get(ctx, cacheKey)
 		assert.Error(t, err)
-		assert.Equal(t, redis.Nil, err)
+		assert.True(t, IsCacheMiss(err))
 	})
+}
+
+func TestRedisCache_GetOrSet(t *testing.T) {
+	mr, cache := setupTestRedis(t)
+	defer mr.Close()
+
+	ctx := context.Background()
+
+	t.Run("cache hit returns existing value", func(t *testing.T) {
+		require.NoError(t, mr.Set("gos-hit", "cached-value"))
+
+		called := false
+		val, err := GetOrSet(ctx, cache, "gos-hit", time.Minute, func(_ context.Context) (string, error) {
+			called = true
+			return "fn-value", nil
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, "cached-value", val)
+		assert.False(t, called, "fn must not be called on hit")
+	})
+
+	t.Run("cache miss calls fn and stores result", func(t *testing.T) {
+		val, err := GetOrSet(ctx, cache, "gos-miss", time.Minute, func(_ context.Context) (string, error) {
+			return "computed-value", nil
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, "computed-value", val)
+
+		stored, err := mr.Get("gos-miss")
+		assert.NoError(t, err)
+		assert.Equal(t, "computed-value", stored)
+	})
+
+	t.Run("fn error propagated", func(t *testing.T) {
+		_, err := GetOrSet(ctx, cache, "gos-err", time.Minute, func(_ context.Context) (string, error) {
+			return "", assert.AnError
+		})
+		assert.Error(t, err)
+		assert.ErrorIs(t, err, assert.AnError)
+
+		exists := mr.Exists("gos-err")
+		assert.False(t, exists, "key must not be stored on fn error")
+	})
+
+	t.Run("cache miss with nil result and CacheNil=true", func(t *testing.T) {
+		key := "gos-nil"
+		val, err := GetOrSet(ctx, cache, key, time.Minute, func(_ context.Context) (string, error) {
+			return "", nil
+		}, GetOrSetOptions{CacheNil: true})
+		assert.NoError(t, err)
+		assert.Empty(t, val)
+
+		// Second call must not call fn (sentinel hit)
+		called := false
+		val, err = GetOrSet(ctx, cache, key, time.Minute, func(_ context.Context) (string, error) {
+			called = true
+			return "should-not-reach", nil
+		}, GetOrSetOptions{CacheNil: true})
+		assert.NoError(t, err)
+		assert.Empty(t, val)
+		assert.False(t, called)
+	})
+
+	t.Run("context cancellation propagated", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err := GetOrSet(ctx, cache, "gos-cancel", time.Minute, func(_ context.Context) (string, error) {
+			return "value", nil
+		})
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "context canceled")
+	})
+}
+
+func TestRedisCache_GetOrSet_ThunderingHerd(t *testing.T) {
+	mr, cache := setupTestRedis(t)
+	defer mr.Close()
+
+	ctx := context.Background()
+	key := "gos-herd"
+
+	var callCount atomic.Int32
+	var wg sync.WaitGroup
+	n := 10
+
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			val, err := GetOrSet(ctx, cache, key, time.Minute, func(_ context.Context) (string, error) {
+				callCount.Add(1)
+				return "herd-value", nil
+			})
+			assert.NoError(t, err)
+			assert.Equal(t, "herd-value", val)
+		}()
+	}
+	wg.Wait()
+
+	assert.Equal(t, int32(1), callCount.Load(), "fn must be called exactly once")
+}
+
+func TestRedisCache_GetOrSet_CustomLockTTL(t *testing.T) {
+	mr, cache := setupTestRedis(t)
+	defer mr.Close()
+
+	ctx := context.Background()
+
+	val, err := GetOrSet(ctx, cache, "gos-lockttl", time.Minute, func(_ context.Context) (string, error) {
+		return "custom-lock", nil
+	}, GetOrSetOptions{LockTTL: 5 * time.Second})
+	assert.NoError(t, err)
+	assert.Equal(t, "custom-lock", val)
 }

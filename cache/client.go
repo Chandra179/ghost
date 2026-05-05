@@ -2,8 +2,20 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+var (
+	ErrCacheMiss    = errors.New("cache miss")
+	ErrCacheTimeout = errors.New("cache operation timeout")
+)
+
+// IsCacheMiss reports whether err represents a cache miss.
+// Use instead of comparing to redis.Nil directly.
+func IsCacheMiss(err error) bool {
+	return errors.Is(err, ErrCacheMiss)
+}
 
 type Cache interface {
 	Set(ctx context.Context, key string, value string, ttl time.Duration) error

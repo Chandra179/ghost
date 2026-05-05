@@ -4,6 +4,8 @@ import (
 	"context"
 	"log"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -201,4 +203,267 @@ func TestCacheRefresh(t *testing.T) {
 
 	_, err = c.Get(ctx, "refresh-key")
 	assert.Error(t, err)
+}
+
+func TestGetOrSet_Hit(t *testing.T) {
+	c := newCache(t, "gos-hit")
+	ctx := context.Background()
+
+	require.NoError(t, c.Set(ctx, "gos-hit", "cached-value", time.Minute))
+
+	called := false
+	val, err := cache.GetOrSet(ctx, c, "gos-hit", time.Minute, func(_ context.Context) (string, error) {
+		called = true
+		return "fn-value", nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "cached-value", val)
+	assert.False(t, called)
+}
+
+func TestGetOrSet_Miss(t *testing.T) {
+	c := newCache(t, "gos-miss")
+	ctx := context.Background()
+
+	val, err := cache.GetOrSet(ctx, c, "gos-miss", time.Minute, func(_ context.Context) (string, error) {
+		return "computed", nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "computed", val)
+
+	// Verify stored
+	stored, err := c.Get(ctx, "gos-miss")
+	require.NoError(t, err)
+	assert.Equal(t, "computed", stored)
+}
+
+func TestGetOrSet_FnError(t *testing.T) {
+	c := newCache(t, "gos-err")
+	ctx := context.Background()
+
+	_, err := cache.GetOrSet(ctx, c, "gos-err", time.Minute, func(_ context.Context) (string, error) {
+		return "", assert.AnError
+	})
+	assert.Error(t, err)
+
+	// Key must not be stored
+	_, err = c.Get(ctx, "gos-err")
+	assert.Error(t, err)
+}
+
+func TestGetOrSet_ContextCancelled(t *testing.T) {
+	c := newCache(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := cache.GetOrSet(ctx, c, "gos-ctx", time.Minute, func(_ context.Context) (string, error) {
+		return "value", nil
+	})
+	assert.Error(t, err)
+}
+
+func TestGetOrSet_ThunderingHerd(t *testing.T) {
+	c := newCache(t, "gos-herd")
+	ctx := context.Background()
+
+	var callCount atomic.Int32
+	var wg sync.WaitGroup
+	n := 10
+
+	for range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			val, err := cache.GetOrSet(ctx, c, "gos-herd", time.Minute, func(_ context.Context) (string, error) {
+				callCount.Add(1)
+				time.Sleep(10 * time.Millisecond)
+				return "herd-value", nil
+			})
+			assert.NoError(t, err)
+			assert.Equal(t, "herd-value", val)
+		}()
+	}
+	wg.Wait()
+
+	assert.Equal(t, int32(1), callCount.Load(), "fn must execute exactly once")
+}
+
+// Real-world scenario: fetch user profile from simulated DB, cache result.
+// Demonstrates cache-aside with stampede protection for a read-heavy profile endpoint.
+func TestGetOrSet_UserProfileScenario(t *testing.T) {
+	c := newCache(t, "profile:user-42", "profile:user-stampede")
+	ctx := context.Background()
+
+	// Simulated DB: user profiles keyed by ID.
+	type profile struct{ id, name, email string }
+	db := map[string]profile{
+		"user-42": {id: "42", name: "Alice", email: "alice@example.com"},
+	}
+
+	// Simulate DB call counter.
+	var dbCallCount atomic.Int32
+
+	// Cache miss — GetOrSet calls fn (simulated DB query).
+	val, err := cache.GetOrSet(ctx, c, "profile:user-42", time.Minute, func(_ context.Context) (string, error) {
+		dbCallCount.Add(1)
+		u, ok := db["user-42"]
+		if !ok {
+			return "", nil
+		}
+		return u.name + "|" + u.email, nil
+	}, cache.GetOrSetOptions{CacheNil: true})
+	require.NoError(t, err)
+	assert.Equal(t, "Alice|alice@example.com", val)
+	assert.Equal(t, int32(1), dbCallCount.Load(), "DB must be queried exactly once")
+
+	// Second call — cache hit, no DB query.
+	val, err = cache.GetOrSet(ctx, c, "profile:user-42", time.Minute, func(_ context.Context) (string, error) {
+		dbCallCount.Add(1)
+		return "should-not-reach", nil
+	}, cache.GetOrSetOptions{CacheNil: true})
+	require.NoError(t, err)
+	assert.Equal(t, "Alice|alice@example.com", val)
+	assert.Equal(t, int32(1), dbCallCount.Load(), "DB must NOT be queried on cache hit")
+
+	// Stampede: fresh key with concurrent callers — fn called exactly once.
+	var wg sync.WaitGroup
+	dbCallCount.Store(0)
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			val, err := cache.GetOrSet(ctx, c, "profile:user-stampede", time.Minute, func(_ context.Context) (string, error) {
+				dbCallCount.Add(1)
+				time.Sleep(10 * time.Millisecond) // simulate slow DB
+				u := db["user-42"]
+				return u.name + "|" + u.email, nil
+			}, cache.GetOrSetOptions{CacheNil: true})
+			assert.NoError(t, err)
+			assert.Equal(t, "Alice|alice@example.com", val)
+		}()
+	}
+	wg.Wait()
+	assert.Equal(t, int32(1), dbCallCount.Load(), "concurrent requests must not trigger extra DB calls")
+}
+
+// Distributed stampede: 2 separate Cache instances (simulating 2 nodes)
+// contend for same key. Only 1 fn call across both.
+func TestGetOrSet_DistributedStampede(t *testing.T) {
+	ctx := context.Background()
+
+	// Two independent clients = two separate "services" talking to same Redis.
+	node1 := cache.NewRedisCache(sharedCache.(*cache.RedisCache).Addr())
+	node2 := cache.NewRedisCache(sharedCache.(*cache.RedisCache).Addr())
+	t.Cleanup(func() { node1.Close(); node2.Close() })
+	t.Cleanup(func() {
+		_ = sharedCache.Del(ctx, "dist-stampede")
+		_ = sharedCache.Del(ctx, "dist-stampede:lock")
+	})
+
+	var callCount atomic.Int32
+	var wg sync.WaitGroup
+
+	for range 5 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			val, err := cache.GetOrSet(ctx, node1, "dist-stampede", time.Minute, func(_ context.Context) (string, error) {
+				callCount.Add(1)
+				time.Sleep(20 * time.Millisecond)
+				return "dist-value", nil
+			})
+			assert.NoError(t, err)
+			assert.Equal(t, "dist-value", val)
+		}()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			val, err := cache.GetOrSet(ctx, node2, "dist-stampede", time.Minute, func(_ context.Context) (string, error) {
+				callCount.Add(1)
+				time.Sleep(20 * time.Millisecond)
+				return "dist-value", nil
+			})
+			assert.NoError(t, err)
+			assert.Equal(t, "dist-value", val)
+		}()
+	}
+	wg.Wait()
+
+	assert.Equal(t, int32(1), callCount.Load(), "2 nodes, 10 total goroutines — fn must execute once across all")
+}
+
+// Lock-holder crash: lock TTL short, holder dies mid-compute.
+// Waiters spin-wait up to ~500ms, lock expires, fall through to fn.
+func TestGetOrSet_LockHolderCrash(t *testing.T) {
+	ctx := context.Background()
+	node1 := cache.NewRedisCache(sharedCache.(*cache.RedisCache).Addr())
+	node2 := cache.NewRedisCache(sharedCache.(*cache.RedisCache).Addr())
+	t.Cleanup(func() { node1.Close(); node2.Close() })
+	t.Cleanup(func() {
+		_ = sharedCache.Del(ctx, "crash-key")
+		_ = sharedCache.Del(ctx, "crash-key:lock")
+	})
+
+	var callCount atomic.Int32
+	var wg sync.WaitGroup
+	locked := make(chan struct{})
+
+	// Node1 acquires lock, sleeps past lock TTL AND past spin-wait deadline.
+	// Lock TTL=50ms (expires fast), fn sleeps 600ms (>500ms spin-wait cap).
+	// Node2's spin-wait exhausts -> falls through to fn.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		val, err := cache.GetOrSet(ctx, node1, "crash-key", time.Minute, func(_ context.Context) (string, error) {
+			callCount.Add(1)
+			close(locked)
+			time.Sleep(600 * time.Millisecond)
+			return "crash-recovered", nil
+		}, cache.GetOrSetOptions{LockTTL: 50 * time.Millisecond})
+		assert.NoError(t, err)
+		assert.Equal(t, "crash-recovered", val)
+	}()
+
+	<-locked
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		val, err := cache.GetOrSet(ctx, node2, "crash-key", time.Minute, func(_ context.Context) (string, error) {
+			callCount.Add(1)
+			return "crash-recovered", nil
+		}, cache.GetOrSetOptions{LockTTL: 50 * time.Millisecond})
+		assert.NoError(t, err)
+		assert.Equal(t, "crash-recovered", val)
+	}()
+
+	wg.Wait()
+
+	assert.Equal(t, int32(2), callCount.Load(), "spin-wait exhausted — fallback must execute fn")
+}
+
+// Real-world scenario: user not found — CacheNil prevents repeated DB lookups.
+func TestGetOrSet_UserNotFoundScenario(t *testing.T) {
+	c := newCache(t, "profile:user-999")
+	ctx := context.Background()
+
+	var dbCallCount atomic.Int32
+
+	// First call: user not found in DB, fn returns empty string.
+	val, err := cache.GetOrSet(ctx, c, "profile:user-999", time.Minute, func(_ context.Context) (string, error) {
+		dbCallCount.Add(1)
+		return "", nil // user not found
+	}, cache.GetOrSetOptions{CacheNil: true})
+	require.NoError(t, err)
+	assert.Empty(t, val)
+	assert.Equal(t, int32(1), dbCallCount.Load())
+
+	// Second call: CacheNil hit — returns empty without calling fn.
+	val, err = cache.GetOrSet(ctx, c, "profile:user-999", time.Minute, func(_ context.Context) (string, error) {
+		dbCallCount.Add(1)
+		return "should-not-reach", nil
+	}, cache.GetOrSetOptions{CacheNil: true})
+	require.NoError(t, err)
+	assert.Empty(t, val)
+	assert.Equal(t, int32(1), dbCallCount.Load(), "repeated not-found lookups must not hit DB")
 }

@@ -1,0 +1,42 @@
+sequenceDiagram
+    participant C1 as Caller 1 (lock holder)
+    participant C2 as Caller 2 (spin-waiter)
+    participant C3 as Caller N (spin-waiter)
+    participant R as Redis
+
+    Note over C1,C3: All request same key — cache miss
+
+    C1->>R: GET key
+    C2->>R: GET key
+    C3->>R: GET key
+    R-->>C1: miss (nil)
+    R-->>C2: miss (nil)
+    R-->>C3: miss (nil)
+
+    C1->>R: SETNX key:lock (lock acquired)
+    R-->>C1: true
+    C2->>R: SETNX key:lock
+    R-->>C2: false
+    C3->>R: SETNX key:lock
+    R-->>C3: false
+
+    Note over C1: Lock holder path
+    C1->>R: GET key (double-check)
+    R-->>C1: miss (nil)
+    C1->>C1: fn() — compute value (DB query / API call)
+    C1->>R: SET key value TTL
+    C1->>R: DEL key:lock (release lock)
+    C1-->>C1: return value
+
+    Note over C2,C3: Spin-wait path
+    loop up to ~500ms
+        C2->>R: GET key
+        C3->>R: GET key
+        Note over C2: exponential backoff 5ms→50ms
+    end
+    R-->>C2: value
+    R-->>C3: value
+    C2-->>C2: return value
+    C3-->>C3: return value
+
+    Note over C1,C3: All 3 callers get result. fn() called once.
