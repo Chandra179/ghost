@@ -3,6 +3,8 @@ package rabbitmq
 import (
 	"errors"
 	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 // ErrURLRequired is returned when the RabbitMQ URL is not provided
@@ -60,6 +62,15 @@ type Config struct {
 	// Reconnection settings
 	ReconnectInitialInterval time.Duration
 	ReconnectMaxInterval     time.Duration
+
+	// Connection tuning (0 = use RabbitMQ defaults / server-negotiated)
+	Heartbeat  time.Duration
+	ChannelMax int
+	FrameSize  int
+
+	// OnReturn is called when a mandatory message cannot be routed.
+	// Must be set before NewClient; not changed during the client lifetime.
+	OnReturn func(amqp.Return)
 }
 
 // NewDefaultConfig returns a Config with default values applied

@@ -90,6 +90,8 @@ func (c *Consumer) startConsumeLoop(ctx context.Context, opts ConsumeOptions, ha
 		return fmt.Errorf("failed to start consuming: %w", err)
 	}
 
+	cancelChan := ch.NotifyCancel(make(chan string, 1))
+
 	c.logger.Info("started consuming",
 		"queue", opts.QueueName,
 		"consumer", opts.Consumer,
@@ -102,6 +104,17 @@ func (c *Consumer) startConsumeLoop(ctx context.Context, opts ConsumeOptions, ha
 		case <-ctx.Done():
 			ch.Close()
 			return ctx.Err()
+
+		case reason, ok := <-cancelChan:
+			ch.Close()
+			if ok {
+				c.logger.Warn("consumer cancelled by broker",
+					"queue", opts.QueueName,
+					"reason", reason,
+				)
+				return fmt.Errorf("consumer cancelled by broker: %s", reason)
+			}
+			return fmt.Errorf("consumer cancelled by broker")
 
 		case delivery, ok := <-deliveries:
 			if !ok {

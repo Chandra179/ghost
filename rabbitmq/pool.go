@@ -26,7 +26,9 @@ func newChannelPool(size int) *channelPool {
 }
 
 // fill populates the pool with channels from the given connection.
-func (p *channelPool) fill(conn *amqp.Connection, enableConfirms bool) error {
+// If onReturn is non-nil, a NotifyReturn listener is registered per channel
+// and forwarded to the callback in a dedicated goroutine.
+func (p *channelPool) fill(conn *amqp.Connection, enableConfirms bool, onReturn func(amqp.Return)) error {
 	for i := 0; i < p.size; i++ {
 		ch, err := conn.Channel()
 		if err != nil {
@@ -38,6 +40,15 @@ func (p *channelPool) fill(conn *amqp.Connection, enableConfirms bool) error {
 				ch.Close()
 				return fmt.Errorf("failed to enable confirms on channel %d: %w", i, err)
 			}
+		}
+
+		if onReturn != nil {
+			returnChan := ch.NotifyReturn(make(chan amqp.Return, 1))
+			go func() {
+				for r := range returnChan {
+					onReturn(r)
+				}
+			}()
 		}
 
 		p.channels <- ch

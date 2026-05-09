@@ -130,7 +130,7 @@ func (c *Client) connect() error {
 
 	// Drain stale channels and fill pool from the new connection
 	c.publisherPool.drain()
-	if err := c.publisherPool.fill(pubConn, c.config.PublisherConfirms); err != nil {
+	if err := c.publisherPool.fill(pubConn, c.config.PublisherConfirms, c.config.OnReturn); err != nil {
 		pubConn.Close()
 		consConn.Close()
 		return fmt.Errorf("channel pool initialization failed: %w", err)
@@ -143,6 +143,9 @@ func (c *Client) connect() error {
 
 	c.setupNotifyHandlers()
 
+	go c.handleConnectionBlocked(pubConn, "publisher")
+	go c.handleConnectionBlocked(consConn, "consumer")
+
 	return nil
 }
 
@@ -153,6 +156,16 @@ func (c *Client) dial(connType string) (*amqp.Connection, error) {
 		Properties: amqp.Table{
 			"connection_name": fmt.Sprintf("%s-%s", c.config.ConnectionName, connType),
 		},
+	}
+
+	if c.config.Heartbeat > 0 {
+		config.Heartbeat = c.config.Heartbeat
+	}
+	if c.config.ChannelMax > 0 {
+		config.ChannelMax = uint16(c.config.ChannelMax)
+	}
+	if c.config.FrameSize > 0 {
+		config.FrameSize = c.config.FrameSize
 	}
 
 	conn, err := amqp.DialConfig(c.config.URL, config)
@@ -186,6 +199,32 @@ func (c *Client) handleConnectionClose(conn *amqp.Connection, connType string) {
 				c.publisherPool.drain()
 				c.triggerReconnect()
 			}()
+		}
+	}
+}
+
+// handleConnectionBlocked watches for broker resource alarms.
+func (c *Client) handleConnectionBlocked(conn *amqp.Connection, connType string) {
+	blocked := conn.NotifyBlocked(make(chan amqp.Blocking, 1))
+
+	for {
+		select {
+		case <-c.closeChan:
+			return
+		case blocking, ok := <-blocked:
+			if !ok {
+				return
+			}
+			if blocking.Active {
+				c.logger.Warn("rabbitmq connection blocked",
+					"connection_type", connType,
+					"reason", blocking.Reason,
+				)
+			} else {
+				c.logger.Info("rabbitmq connection unblocked",
+					"connection_type", connType,
+				)
+			}
 		}
 	}
 }

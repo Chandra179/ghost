@@ -28,12 +28,31 @@ func NewProducer(client *Client) Publisher {
 }
 
 // PublishOptions contains options for publishing a message.
+// All fields are optional; zero values fall back to Config defaults
+// or sensible behaviour (e.g. ContentType defaults to "application/json").
 type PublishOptions struct {
 	Exchange   string
 	RoutingKey string
 	Mandatory  bool
 	Immediate  bool
-	Headers    map[string]interface{}
+
+	// AMQP message properties
+	MessageId       string
+	CorrelationId   string
+	ReplyTo         string
+	Expiration      string
+	Priority        uint8
+	Type            string
+	AppId           string
+	UserId          string
+	ContentType     string
+	ContentEncoding string
+	Timestamp       time.Time
+
+	// DeliveryMode: 0 = use Config.PersistentDelivery, 1 = transient, 2 = persistent
+	DeliveryMode uint8
+
+	Headers map[string]interface{}
 }
 
 // PublishMessage publishes a message to the specified exchange/routing key.
@@ -87,7 +106,9 @@ func (p *Producer) PublishMessage(ctx context.Context, opts PublishOptions, payl
 	}
 
 	deliveryMode := amqp.Transient
-	if p.client.config.PersistentDelivery {
+	if opts.DeliveryMode != 0 {
+		deliveryMode = opts.DeliveryMode
+	} else if p.client.config.PersistentDelivery {
 		deliveryMode = amqp.Persistent
 	}
 
@@ -96,17 +117,30 @@ func (p *Producer) PublishMessage(ctx context.Context, opts PublishOptions, payl
 		mandatory = true
 	}
 
+	contentType := opts.ContentType
+	if contentType == "" {
+		contentType = "application/json"
+	}
+
 	publishing := amqp.Publishing{
-		ContentType:  "application/json",
-		Body:         body,
-		DeliveryMode: deliveryMode,
-		Headers:      headers,
+		ContentType:     contentType,
+		ContentEncoding: opts.ContentEncoding,
+		Body:            body,
+		DeliveryMode:    deliveryMode,
+		Priority:        opts.Priority,
+		MessageId:       opts.MessageId,
+		CorrelationId:   opts.CorrelationId,
+		ReplyTo:         opts.ReplyTo,
+		Expiration:      opts.Expiration,
+		Type:            opts.Type,
+		AppId:           opts.AppId,
+		UserId:          opts.UserId,
+		Timestamp:       opts.Timestamp,
+		Headers:         headers,
 	}
 
 	if p.client.config.PublisherConfirms {
-		confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 1))
-
-		err = ch.PublishWithContext(
+		dc, err := ch.PublishWithDeferredConfirmWithContext(
 			ctx,
 			opts.Exchange,
 			opts.RoutingKey,
@@ -119,16 +153,17 @@ func (p *Producer) PublishMessage(ctx context.Context, opts PublishOptions, payl
 			return fmt.Errorf("failed to publish message: %w", err)
 		}
 
-		select {
-		case confirm := <-confirms:
-			if !confirm.Ack {
+		if dc != nil {
+			acked, waitErr := dc.WaitContext(ctx)
+			if waitErr != nil {
+				span.RecordError(waitErr)
+				return waitErr
+			}
+			if !acked {
 				err := fmt.Errorf("message was nacked by broker")
 				span.RecordError(err)
 				return err
 			}
-		case <-ctx.Done():
-			span.RecordError(ctx.Err())
-			return ctx.Err()
 		}
 	} else {
 		err = ch.PublishWithContext(
