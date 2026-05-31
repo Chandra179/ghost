@@ -12,6 +12,7 @@ Multi-module Go monorepo. Each subdirectory is its own Go module.
 | rabbitmq/ | `rabbitmq` | yes | yes (testcontainers) |
 | oauth2/ | `oauth2` | yes | no* — mock OIDC server |
 | i18n/ | `i18n` | yes | no — file-based only |
+| cryptoutil/ | `cryptoutil` | yes | no — pure Go only |
 | logger/ | `github.com/Chandra179/gosdk` | **no** | no |
 
 ## Commands
@@ -23,6 +24,9 @@ cd db/ && make test
 
 # cache unit tests (miniredis, no Docker)
 cd cache/ && go test -v -count=1 ./...
+
+# cryptoutil unit tests (pure Go, no Docker)
+cd cryptoutil/ && go test -v -count=1 ./...
 
 # logger (no Makefile, uses standard go module path)
 cd logger/ && go test -v ./...

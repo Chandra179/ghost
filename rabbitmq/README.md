@@ -1,128 +1,479 @@
 # rabbitmq
 
-Go SDK module for RabbitMQ with auto-reconnection, channel pooling, OTel tracing, and dead-letter support.
+Go SDK for RabbitMQ with auto-reconnection, channel pooling, OTel tracing, and dead-letter support.
 
-## Component Diagram
+## Topology
 
-```mermaid
-graph TB
-    subgraph External["External Dependencies"]
-        Broker[("RabbitMQ Broker<br/><i>AMQP 0-9-1</i>")]
-        OTel["OpenTelemetry<br/><i>Trace Propagation</i>"]
-        AMQPLib["amqp091-go<br/><i>AMQP Client Library</i>"]
-    end
+```
+┌─────────────────────────────────────────────────────┐
+│                    rabbitmq package                   │
+│                                                       │
+│  ┌─────────────────────────────────────────────────┐ │
+│  │  Connection Layer                                │ │
+│  │  ┌──────────┐ ┌───────────┐ ┌────────────────┐ │ │
+│  │  │  Client   │ │channelPool│ │ TopologyCache  │ │ │
+│  │  │dual AMQP │ │N pub chan │ │ queues,exchs,  │ │ │
+│  │  │conns +   │ │get/return │ │ bindings saved │ │ │
+│  │  │state mach│ │drain/close│ │ for reconnect  │ │ │
+│  │  └────┬─────┘ └─────┬─────┘ └───────┬────────┘ │ │
+│  └───────┼─────────────┼───────────────┼───────────┘ │
+│          │             │               │              │
+│  ┌───────┴─────────────┴───────────────┴───────────┐ │
+│  │  Messaging Layer                                 │ │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────────────┐ │ │
+│  │  │ Producer │ │ Consumer │ │ BatchConsumer    │ │ │
+│  │  │ publish  │ │ manual/  │ │ accumulate →     │ │ │
+│  │  │ batch,   │ │ auto ack │ │ flush on size/   │ │ │
+│  │  │ confirms │ │ retry/DLX│ │ timeout, batch   │ │ │
+│  │  │ OTel inj │ │ OTel ext │ │ ack/nack         │ │ │
+│  │  └────┬─────┘ └────┬────┘ └────────┬─────────┘ │ │
+│  └───────┼──────────────┼──────────────┼───────────┘ │
+│          │              │              │              │
+│  ┌───────┴──────────────┴──────────────┴───────────┐ │
+│  │  TopologyManager (implements TopologyDeclarer)  │ │
+│  │  QueueDeclare → ExchangeDeclare → BindQueue     │ │
+│  │  SetupDeadLetterExchange()                      │ │
+│  │  Re-declares all cached topology on reconnect   │ │
+│  └──────────────────────┬──────────────────────────┘ │
+│                         │                             │
+│  ┌──────────────────────┴──────────────────────────┐ │
+│  │  Config: URL, conn, producer, consumer, retry,  │ │
+│  │  reconnect settings, DLX flags                  │ │
+│  └─────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────┘
 
-    subgraph Package["rabbitmq package"]
-
-        subgraph Connection["Connection Layer"]
-            Client["<b>Client</b><br/>Connection Manager<br/><i>Dual connections, state machine,<br/>auto-reconnect with backoff</i>"]
-            Pool["<b>ChannelPool</b><br/>Publisher Channel Pool<br/><i>Context-aware get/return,<br/>safe drain &amp; close</i>"]
-            Cache["<b>TopologyCache</b><br/>Reconnection State<br/><i>Queues, exchanges, bindings<br/>restored after reconnect</i>"]
-        end
-
-        subgraph Messaging["Messaging Layer"]
-            Producer["<b>Producer</b><br/>«Publisher»<br/><i>Publish with confirms,<br/>batch publish, OTel inject</i>"]
-            Consumer["<b>Consumer</b><br/>«Subscriber»<br/><i>QoS, manual ack, retry/DLX,<br/>auto-reconnect, OTel extract</i>"]
-            Batch["<b>BatchConsumer</b><br/>Batch Subscriber<br/><i>Accumulate → flush on size/timeout,<br/>batch ack/nack</i>"]
-        end
-
-        subgraph Infra["Infrastructure Layer"]
-            Topology["<b>TopologyManager</b><br/>«TopologyDeclarer»<br/><i>Declare queues, exchanges,<br/>bindings, DLX setup</i>"]
-        end
-
-        subgraph Cfg["Configuration"]
-            Config["<b>Config</b><br/><i>Connection, producer,<br/>consumer, queue, retry,<br/>reconnect settings</i>"]
-        end
-    end
-
-    %% Internal relationships
-    Producer -- "GetPublisherChannel(ctx)<br/>ReturnPublisherChannel" --> Client
-    Consumer -- "CreateConsumerChannel" --> Client
-    Batch -- "CreateConsumerChannel" --> Client
-    Topology -- "CreateConsumerChannel" --> Client
-
-    Client -- "fill / get / return /<br/>drain / close" --> Pool
-    Client -. "restores on<br/>reconnect" .-> Cache
-    Topology -. "caches<br/>declarations" .-> Cache
-
-    Client -. "reads" .-> Config
-    Producer -. "reads" .-> Config
-    Consumer -. "reads" .-> Config
-
-    %% External relationships
-    Client -- "Dial / Channel" --> AMQPLib
-    AMQPLib -- "AMQP 0-9-1<br/>protocol" --> Broker
-
-    Producer -- "Inject trace ctx<br/>into headers" --> OTel
-    Consumer -- "Extract trace ctx<br/>from headers" --> OTel
-    Batch -- "Extract trace ctx<br/>from headers" --> OTel
-
-    %% Styling
-    classDef iface fill:#e1f5fe,stroke:#0288d1,stroke-width:2px
-    classDef internal fill:#f3e5f5,stroke:#7b1fa2,stroke-width:1px
-    classDef ext fill:#fff3e0,stroke:#ef6c00,stroke-width:2px
-    classDef store fill:#e8f5e9,stroke:#2e7d32,stroke-width:1px
-
-    class Producer,Consumer,Topology iface
-    class Client,Pool,Batch internal
-    class Broker,OTel,AMQPLib ext
-    class Cache,Config store
+            │ Dial / Channel
+            ▼
+┌───────────────────────┐
+│   amqp091-go (AMQP)   │
+└───────────┬───────────┘
+            │ AMQP 0-9-1
+            ▼
+┌───────────────────────┐
+│  RabbitMQ Broker      │
+└───────────────────────┘
 ```
 
-## Architecture
+### Dead-Letter Exchange
 
-### Connection Layer
+```
+main queue ──x-dead-letter-exchange──→ DLX (topic exchange)
+       │                                   │
+  Reject(false)                    routing key: orders
+  after max retries                      │
+       │                          orders.retry queue
+       │                          (TTL: 30s, DLX → main)
+       │                                   │
+       │                          TTL expires → main queue
+       │                                   │
+       └─→ DLX ──routing key: orders.parking-lot──→ parking-lot queue
+```
 
-**Client** manages two separate AMQP connections (publisher and consumer) with a state machine (`Disconnected → Connecting → Connected → Closing`). On connection loss, it triggers exponential-backoff reconnection and restores cached topology.
+### channelPool
 
-**ChannelPool** pre-allocates publisher channels into a bounded pool. `get(ctx)` respects context cancellation (no hardcoded timeouts). The pool is safe against send-to-closed-channel panics via atomic close guards.
+RMQ conns have ~finite channel count. New channel per publish → exhaust. Pool recycles N fixed channels.
 
-**TopologyCache** stores declared queues, exchanges, and bindings. On reconnect, the cache is snapshot-and-reset before re-declaring, preventing unbounded growth across reconnection cycles.
+### Publisher Confirm
 
-### Messaging Layer
+RMQ sends ACK/NACK back after broker handles msg. Without confirm: `Publish` returns success as soon as TCP buffer accepts bytes. Msg could be lost before broker routes it (exchange missing, queue full, disk write fail). Set `PublisherConfirms: true` in config.
+## Connection State Machine
 
-**Producer** (`Publisher` interface) publishes JSON messages with optional publisher confirms, OTel trace injection, and a single context-aware retry on disconnect.
+```mermaid
+stateDiagram-v2
+    [*] --> Disconnected : NewClient
+    Disconnected --> Connecting : connect()
+    Connecting --> Connected : both conns + pool ready
+    Connected --> Connecting : connection lost
+    Connecting --> Connecting : retry (backoff)
+    Connected --> Closing : Close()
+    Connecting --> Closing : Close()
+    Disconnected --> Closing : Close()
+    Closing --> [*]
+```
 
-**Consumer** (`Subscriber` interface) consumes messages with QoS prefetch, manual ack by default, retry counting via `x-death` headers, and dead-letter routing. Supports `AutoReconnect` mode that restarts the consume loop after delivery channel closure.
+## Reconnect Flow
 
-**BatchConsumer** accumulates messages up to `batchSize` or `flushTimeout`, then calls the batch handler. It manages its own AMQP channel and ack lifecycle to avoid double-ack bugs.
+```mermaid
+sequenceDiagram
+    participant App
+    participant Client
+    participant Pool
+    participant Cache
+    participant Broker as RabbitMQ
 
-### Infrastructure Layer
+    Broker--)Client: connection close detected
+    Client->>Pool: drain()
+    Client->>Client: CAS Connected → Connecting
+    loop backoff 1s → 2s → ... → 60s
+        Client->>Broker: dial publisher conn
+        Client->>Broker: dial consumer conn
+        alt success
+            Client->>Pool: fill(pubConn)
+            Client->>Cache: snapshot + reset
+            Client->>Cache: re-declare queues
+            Client->>Cache: re-declare exchanges
+            Client->>Cache: re-declare bindings
+            Client->>Client: state = Connected
+        else failure
+            Client->>Client: backoff *= 2
+        end
+    end
+```
 
-**TopologyManager** (`TopologyDeclarer` interface) declares queues (with quorum support), exchanges, bindings, and sets up dead-letter exchanges with retry and parking-lot queues.
+## Dead-Letter Exchange Topology
+
+```mermaid
+graph LR
+    subgraph Main
+        MainQ["orders<br/><i>main queue</i>"]
+    end
+
+    subgraph DLX["orders.dlx<br/><i>topic exchange</i>"]
+    end
+
+    subgraph Retry["Retry"]
+        RetryQ["orders.retry<br/><i>TTL: 30s<br/>DLX → orders</i>"]
+    end
+
+    subgraph DLQ["Dead Letter"]
+        ParkingQ["orders.parking-lot<br/><i>failed messages</i>"]
+    end
+
+    MainQ -- "x-dead-letter-exchange" --> DLX
+    MainQ -- "Reject(false)<br/>after max retries" --> DLX
+    RetryQ -- "TTL expires" --> MainQ
+    DLX -- "routing key: orders" --> RetryQ
+    DLX -- "routing key: orders.parking-lot" --> ParkingQ
+
+    style MainQ fill:#e8f5e9,stroke:#2e7d32
+    style DLX fill:#fff3e0,stroke:#ef6c00
+    style RetryQ fill:#e3f2fd,stroke:#1976d2
+    style ParkingQ fill:#fce4ec,stroke:#c62828
+```
+
+## Message Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant P as Producer
+    participant B as Broker
+    participant Q as Queue
+    participant C as Consumer
+    participant DLX as DLX
+    participant D as ParkingLot
+
+    P->>B: PublishMessage("orders", payload)
+    B->>Q: route
+    Q->>C: deliver
+    C->>C: handler(payload)
+    alt success
+        C->>Q: Ack
+    else handler error, retries < MaxRetries
+        C->>Q: Nack(true) — requeue
+        Note over Q: x-death count incremented
+    else handler error, retries >= MaxRetries
+        C->>Q: Reject(false)
+        Q->>DLX: route via x-dead-letter-exchange
+        DLX->>D: route to parking-lot
+    else JSON unmarshal fails
+        C->>Q: Reject(false)
+        Q->>DLX: route
+    end
+```
+
+## Batch Consumer Flow
+
+```mermaid
+sequenceDiagram
+    participant Q as Queue
+    participant BC as BatchConsumer
+    participant H as BatchHandler
+
+    BC->>Q: Consume (QoS prefetch, autoAck=false)
+    loop accumulating
+        Q-->>BC: delivery
+        BC->>BC: JSON unmarshal
+        BC->>BC: append to batch[]
+        alt batchSize reached
+            BC->>BC: flush()
+        else flushTimeout elapsed
+            BC->>BC: flush()
+        end
+    end
+    BC->>H: handler(ctx, batch, deliveries)
+    alt success
+        H-->>BC: nil
+        BC->>Q: batch Ack (each msg)
+    else failure
+        H-->>BC: error
+        BC->>Q: batch Nack(true) (each msg)
+    end
+    Q-->>BC: ctx cancelled
+    BC->>BC: flush() remaining
+    BC->>Q: close channel
+```
+
+## Public API
+
+### Interfaces
+
+| Interface | Purpose | Constructor |
+|-----------|---------|-------------|
+| `Publisher` | Send messages | `NewProducer(client *Client) Publisher` |
+| `Subscriber` | Consume messages | `NewConsumer(client *Client, logger *slog.Logger) Subscriber` |
+| `TopologyDeclarer` | Declare topology | `NewTopologyManager(client *Client) TopologyDeclarer` |
+
+### Concrete types
+
+| Type | Constructor | Notes |
+|------|-------------|-------|
+| `*Client` | `NewClient(config *Config, logger *slog.Logger) (*Client, error)` | Two AMQP conns (pub + con), channel pool, topology cache |
+| `*BatchConsumer` | `NewBatchConsumer(client *Client, logger *slog.Logger, batchSize int, flushTimeout time.Duration) *BatchConsumer` | Owns its own channel; not part of `Subscriber` interface |
+| `*Config` | `NewDefaultConfig() *Config` | Pre-populated defaults; caller must set `URL` + `ConnectionName` |
+
+### Errors
+
+| Sentinel | Meaning |
+|----------|---------|
+| `ErrNotConnected` | `rabbitmq: client not connected` |
+| `ErrURLRequired` | `rabbitmq: URL is required` |
+
+### Health & State
+
+| Method | Returns |
+|--------|---------|
+| `client.IsHealthy() bool` | `true` when `StateConnected` |
+| `client.GetState() ConnectionState` | `StateDisconnected` / `StateConnecting` / `StateConnected` / `StateClosing` |
+
+---
 
 ## Usage
 
+### Basic
+
 ```go
+logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
 client, err := rabbitmq.NewClient(&rabbitmq.Config{
     URL:              "amqp://guest:guest@localhost:5672/",
     ConnectionName:   "my-service",
     PublisherConfirms: true,
-    // ... see Config for all options
+    QueueType:         rabbitmq.QueueTypeQuorum,
+    RetryEnabled:      true,
+    RetryTTL:          30 * time.Second,
+    MaxRetries:        3,
+    DeadLetterEnabled: true,
 }, logger)
+if err != nil {
+    log.Fatal(err)
+}
 defer client.Close()
+```
 
-// Topology
+### Declare topology
+
+```go
 tm := rabbitmq.NewTopologyManager(client)
+
+// Simple queue
 tm.DeclareQueue(rabbitmq.QueueConfig{Name: "orders", Durable: true})
 
-// Produce
-producer := rabbitmq.NewProducer(client)
-producer.SendMessage(ctx, "orders", payload)
+// Exchange + binding
+tm.DeclareExchange(rabbitmq.ExchangeConfig{Name: "events", Kind: "topic", Durable: true})
+tm.BindQueue(rabbitmq.BindingConfig{
+    QueueName:  "orders",
+    Exchange:   "events",
+    RoutingKey: "order.*",
+})
 
-// Consume (with auto-reconnect)
+// Full DLX setup (creates orders.dlx exchange, orders.retry queue, orders.parking-lot queue)
+tm.SetupDeadLetterExchange("orders", "orders.dlx", 30000)
+
+// Queue with DLX pre-wired
+tm.SetupQueueWithDLX("orders", "orders.dlx")
+```
+
+### Publish
+
+```go
+producer := rabbitmq.NewProducer(client)
+
+// Simple publish to default exchange (routing key = queue name)
+producer.SendMessage(ctx, "orders", orderPayload)
+
+// Publish with custom headers
+producer.SendMessageWithHeaders(ctx, "orders", payload, map[string]interface{}{
+    "x-custom-header": "value",
+})
+
+// Publish to named exchange
+producer.SendToTopic(ctx, "events", "order.created", eventPayload)
+producer.SendToTopicWithHeaders(ctx, "events", "order.created", payload, headers)
+
+// Full control
+producer.PublishMessage(ctx, rabbitmq.PublishOptions{
+    Exchange:    "events",
+    RoutingKey:  "order.updated",
+    DeliveryMode: 2, // persistent
+    MessageId:   "msg-123",
+    Headers:     map[string]interface{}{"region": "eu"},
+}, payload)
+
+// Batch publish (fails fast on first error)
+producer.PublishBatch(ctx, rabbitmq.PublishOptions{
+    Exchange:   "",
+    RoutingKey: "orders",
+}, []interface{}{payload1, payload2, payload3})
+```
+
+### Consume
+
+```go
 consumer := rabbitmq.NewConsumer(client, logger)
+
+handler := func(ctx context.Context, msg interface{}, delivery amqp.Delivery) error {
+    // Process message
+    // Return nil → Ack
+    // Return error → Nack (requeue) or Reject (DLX) based on x-death count
+    return nil
+}
+
+// Minimal (sensible defaults: manual ack, no auto-reconnect)
+consumer.ConsumeWithDefaults(ctx, "orders", handler)
+
+// Full control
 consumer.StartConsumer(ctx, rabbitmq.ConsumeOptions{
     QueueName:     "orders",
-    AutoReconnect: true,
+    Consumer:      "worker-1",
+    AutoReconnect: true, // restart on delivery channel close
 }, handler)
 ```
+
+### Batch consume
+
+```go
+bc := rabbitmq.NewBatchConsumer(client, logger, 100, 5*time.Second)
+
+batchHandler := func(ctx context.Context, messages []interface{}, deliveries []amqp.Delivery) error {
+    // Process batch
+    // Return nil → batch Ack
+    // Return error → batch Nack (requeue all)
+    return nil
+}
+
+bc.StartBatchConsumer(ctx, rabbitmq.ConsumeOptions{
+    QueueName: "orders",
+    Consumer:  "batch-worker",
+}, batchHandler)
+```
+
+---
+
+## Configuration Reference
+
+### Config (top-level)
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `URL` | `string` | **required** | AMQP connection string |
+| `ConnectionName` | `string` | **required** | Identifies client in broker UI |
+| `PublisherConfirms` | `bool` | `false` | Enable per-message publisher confirms |
+| `ChannelPoolSize` | `int` | `10` | Number of pre-allocated publisher channels |
+| `Mandatory` | `bool` | `false` | Broker returns unroutable messages via `OnReturn` |
+| `PersistentDelivery` | `bool` | `false` | Default `DeliveryMode = 2` (overridable per-message) |
+| `PrefetchCount` | `int` | `10` | Consumer QoS prefetch count |
+| `AutoAck` | `bool` | `false` | Should always be `false` in production |
+| `QueueType` | `QueueType` | `"quorum"` | `QueueTypeQuorum` or `QueueTypeClassic` |
+| `Durable` | `bool` | `true` | Queue durability default |
+| `AutoDelete` | `bool` | `false` | Queue auto-delete default |
+| `Exclusive` | `bool` | `false` | Queue exclusivity default |
+| `NoWait` | `bool` | `false` | Queue no-wait default |
+| `RetryEnabled` | `bool` | `false` | Enable retry logic in consumer |
+| `RetryTTL` | `time.Duration` | `30s` | Retry queue message TTL |
+| `MaxRetries` | `int` | `3` | Max retry count (from `x-death` header) |
+| `DeadLetterEnabled` | `bool` | `false` | Enable DLX routing for failed messages |
+| `ReconnectInitialInterval` | `time.Duration` | `1s` | Exponential backoff start |
+| `ReconnectMaxInterval` | `time.Duration` | `60s` | Exponential backoff cap |
+| `Heartbeat` | `time.Duration` | `0` | `0` = server-negotiated |
+| `ChannelMax` | `int` | `0` | `0` = server-negotiated |
+| `FrameSize` | `int` | `0` | `0` = server-negotiated |
+| `OnReturn` | `func(amqp.Return)` | `nil` | Callback for unroutable mandatory messages |
+
+### QueueConfig
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `Name` | `string` | Queue name |
+| `Durable` | `bool` | Survive broker restart |
+| `AutoDelete` | `bool` | Delete when last consumer disconnects |
+| `Exclusive` | `bool` | Only accessible by declaring connection |
+| `NoWait` | `bool` | Don't wait for broker confirmation |
+| `Args` | `map[string]interface{}` | Custom arguments (e.g. `x-queue-type`) |
+
+### ExchangeConfig
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `Name` | `string` | Exchange name |
+| `Kind` | `string` | `direct`, `fanout`, `topic`, `headers` |
+| `Durable` | `bool` | Survive broker restart |
+| `AutoDelete` | `bool` | Delete when no queues bound |
+| `Internal` | `bool` | Internal exchange (no publisher access) |
+| `NoWait` | `bool` | Don't wait for broker confirmation |
+| `Args` | `map[string]interface{}` | Custom arguments |
+
+### BindingConfig
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `QueueName` | `string` | Queue to bind |
+| `Exchange` | `string` | Exchange to bind to |
+| `RoutingKey` | `string` | Routing key pattern |
+| `NoWait` | `bool` | Don't wait for broker confirmation |
+| `Args` | `map[string]interface{}` | Custom arguments |
+
+### PublishOptions
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `Exchange` | `string` | Exchange name (empty = default exchange) |
+| `RoutingKey` | `string` | Routing key (or queue name for default exchange) |
+| `Mandatory` | `bool` | Override Config.Mandatory |
+| `Immediate` | `bool` | AMQP immediate flag |
+| `MessageId` | `string` | App-level message identifier |
+| `CorrelationId` | `string` | Request/reply correlation |
+| `ReplyTo` | `string` | Reply queue address |
+| `Expiration` | `string` | Per-message TTL string |
+| `Priority` | `uint8` | Message priority (0-9) |
+| `Type` | `string` | Message type name |
+| `AppId` | `string` | Application identifier |
+| `UserId` | `string` | User identifier |
+| `ContentType` | `string` | MIME type (default: `"application/json"`) |
+| `ContentEncoding` | `string` | Content encoding |
+| `Timestamp` | `time.Time` | Message timestamp |
+| `DeliveryMode` | `uint8` | `0` = use Config, `1` = transient, `2` = persistent |
+| `Headers` | `map[string]interface{}` | Custom headers (OTel context auto-injected) |
+
+### ConsumeOptions
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `QueueName` | `string` | Queue to consume from |
+| `Consumer` | `string` | Consumer tag (name in broker UI) |
+| `AutoAck` | `bool` | Override Config.AutoAck |
+| `Exclusive` | `bool` | Exclusive consumer |
+| `NoLocal` | `bool` | Don't receive own messages |
+| `NoWait` | `bool` | Don't wait for broker confirmation |
+| `Args` | `map[string]interface{}` | Custom arguments |
+| `AutoReconnect` | `bool` | Restart consume loop after delivery channel close |
+
+---
 
 ## Testing
 
 ```bash
-make test
+cd rabbitmq && make test
 # Expands to: go test -tags integration -v -count=1 -timeout 300s ./...
 ```
 
-Requires Docker (testcontainers).
+Requires Docker (testcontainers with `rabbitmq:4.2-management-alpine`).
